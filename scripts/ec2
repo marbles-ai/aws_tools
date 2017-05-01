@@ -1,0 +1,131 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import traceback
+import json
+import subprocess
+import re
+from optparse import OptionParser
+
+
+def die(msg=None):
+	if msg is not None:
+		print("Error: %s" % msg)
+	sys.exit(1)
+
+
+if __name__ == '__main__':
+	print('AWS EC2 Helper V0.1')
+	usage = '''%prog [[options] command]
+  If no command is supplied the default is list.
+  Commands:
+    list: List all available instances [-n|-q]
+    start: Start instance [-n]
+    stop: Stop instance [-n]
+    ssh: SSH into an instance [-n|-i]'''
+	parser = OptionParser(usage)
+	parser.add_option('-n', '--name', dest='name', help='Filter by string or regex')
+	parser.add_option('-D', '--debug', action='store_true', dest='debug', help='Print AWS commands but do not execute')
+	parser.add_option('-u', '--username', dest='username', help='Username')
+	parser.add_option('-i', '--identity', dest='identity', help='PEM identity')
+	(options, args) = parser.parse_args()
+
+	if args is not None and len(args) > 1:
+		die('Only one command allowed')
+	elif args is None or len(args) == 0:
+		args = ['list']
+	command = args[0]
+	if command not in ['list','start','stop','ssh']:
+		die('Bad command - %s' % command)
+
+	try:
+		debug = options.debug or False
+		nameFilter  = options.name or r'.*'
+		pemPath  = options.identity or None
+		userName = options.username or os.getenv('USER', 'root')
+		if debug:
+			print('Filter   = \'%s\'' % nameFilter)
+			print('Username = %s' % userName)
+		code = re.compile(nameFilter)
+	except Exception as e:
+		print(e)
+		raise
+
+	# Get instance info into our dictionary
+	desc = subprocess.Popen(["aws", "ec2", "describe-instances"], stdout=subprocess.PIPE).communicate()[0]
+	desc = json.loads(desc)
+	instances = []
+	for res in desc['Reservations']:
+		rid = res['ReservationId']
+		for inst in res['Instances']:
+			tags = inst['Tags']
+			nm = ''
+			for T in tags:
+				if 'Key' in T and T['Key'] == 'Name' and 'Value' in T:
+					nm = T['Value']
+					break
+		if code.search(nm) is not None:
+			instances.append({'ReservationId':rid, 'InstanceId':inst['InstanceId'], \
+				'Name':nm, 'State':inst['State']['Name'], 'PublicDnsName':inst['PublicDnsName']})
+
+	if len(instances) == 0:
+		die('No instances found matching name filter')
+
+	if command == 'list':
+		# Print instances names and status
+		#     0         1         2         3         4         5         6         7         8
+		#     012345678901234567890123456789012345678901234567890123456789012345678901234567890
+		#      r-0514e30ebd6e7afe2  i-090d70000d18eccf9  Ubuntu    running  DNS
+		print('Reservation-id       Instance-id          Name      Status   Public DNS') 
+		rid = ''
+		for inst in instances:
+			if rid == inst['ReservationId']:
+				hrid = '                 --'
+			else:
+				hrid = inst['ReservationId']
+			print('%-19s  %-19s  %-8s  %-7s  %s' % (hrid, inst['InstanceId'], inst['Name'], inst['State'], inst['PublicDnsName']))
+			rid = inst['ReservationId']
+	
+	elif command == 'start':
+		syscmd = ''
+		for inst in instances:
+			if inst['State'] == 'stopped':
+				syscmd = ' ' + syscmd + inst['InstanceId']
+		if len(syscmd) != 0:
+			syscmd = 'aws ec2 start-instances --instance-ids' + syscmd
+		if debug:
+			print(syscmd)
+		else:
+			os.system(syscmd)
+	
+	elif command == 'stop':
+		syscmd = ''
+		for inst in instances:
+			if inst['State'] == 'running':
+				syscmd = ' ' + syscmd + inst['InstanceId']
+		if len(syscmd) != 0:
+			syscmd = 'aws ec2 stop-instances --instance-ids' + syscmd
+		else:
+			print('Nothing to stop')
+			sys.exit(0)
+		if debug:
+			print(syscmd)
+		else:
+			os.system(syscmd)
+	
+	elif command == 'ssh' and len(instances) == 1:
+		if instances[0]['State'] != 'running':
+			die('Cannot ssh into an instance if not running')
+		if pemPath is not None:
+			syscmd = 'ssh -i %s %s@%s' % (pemPath, userName, instances[0]['PublicDnsName'])	
+		else:
+			syscmd = 'ssh %s@%s' % (userName, instances[0]['PublicDnsName'])	
+		if debug:
+			print(syscmd)
+		else:
+			os.system(syscmd)
+	else:
+		die('SSH only available if name filter matches a single instance')
+
+	sys.exit(0)
